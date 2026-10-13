@@ -231,7 +231,8 @@ uv pip install --python "$PY" sentence-transformers llama-cpp-python
 ## 配置：`local_embed.yaml`
 
 一切——host、port、models、backend——都来自 `local_embed.yaml`，由 CLI 辅助命令或手工写入。路径解析：
-`$LOCAL_EMBED_FILE` > slife 项目根（开发时）> `~/.local-embed/local_embed.yaml`。
+`$LOCAL_EMBED_FILE` > `~/.local-embed/local_embed.yaml`——永远不看当前工作目录。想让配置和自己的放在一起的宿主，
+自己导出 `$LOCAL_EMBED_FILE`；Slife 则把配置铺到 `~/.local-embed/local_embed.yaml` 并依赖这个默认值。
 
 ```yaml
 models:

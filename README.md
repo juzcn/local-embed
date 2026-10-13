@@ -302,7 +302,10 @@ Installing does **not** fetch a model — get the weights first.
 
 Everything — host, port, models, backend — comes from
 `local_embed.yaml`, written by the CLI helpers or by hand. Path resolution:
-`$LOCAL_EMBED_FILE` > slife project root (dev) > `~/.local-embed/local_embed.yaml`.
+`$LOCAL_EMBED_FILE` > `~/.local-embed/local_embed.yaml` — the working directory
+is never consulted. A host that wants the config beside its own exports
+`$LOCAL_EMBED_FILE`; Slife seeds `~/.local-embed/local_embed.yaml` and relies
+on the default.
 
 ```yaml
 models:
