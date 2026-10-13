@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+
+# User config — the default path is ~/.local-embed/local_embed.yaml, but
+# $LOCAL_EMBED_FILE can point one into the working directory.  It holds local
+# machine paths (model weights, cache locations) and does not belong in the
+# repository.
+local_embed.yaml
+
+# Test / tool caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
