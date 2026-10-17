@@ -73,6 +73,11 @@ _KNOWN_MODELS: dict[str, tuple[int, int]] = {
 _DEFAULT_DIM = 1024
 _DEFAULT_MAX_TOKENS = 8192
 
+#: Context window (``n_ctx``) requested from llama-cpp for a GGUF model.
+#: Overridden per model once the weights report their own trained window
+#: (:func:`_read_gguf_window`).  Also the fallback when they cannot.
+_DEFAULT_N_CTX = 8192
+
 
 def _known_model(model: str) -> tuple[int, int] | None:
     """Best-effort (dimension, max_tokens) for a model family we recognise."""
@@ -92,6 +97,24 @@ def _guess_max_tokens(model: str) -> int:
     """Guess the token limit from the model name."""
     pair = _known_model(model)
     return pair[1] if pair else _DEFAULT_MAX_TOKENS
+
+
+def _int_probe(raw: Any) -> int:
+    """Resolve one llama-cpp attribute to an int, or 0 when it is not one.
+
+    ``n_embd`` and ``n_ctx_train`` are bound *methods* on current llama_cpp
+    releases — ``int(n_embd)`` raises ``TypeError`` and would fail every GGUF
+    load — so a callable is invoked first.  A value that is still not an
+    integer (a mock, a string, a ``None``, or a probe that raised) degrades
+    to 0, which every caller reads as "unknown" rather than as a measurement:
+    guessing here would silently shrink a model's advertised limit.
+    """
+    if callable(raw):
+        try:
+            raw = raw()
+        except Exception:  # noqa: BLE001 — any probe failure is "unknown"
+            return 0
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) else 0
 
 
 class EmbeddingInputTooLong(ValueError):
@@ -472,16 +495,22 @@ class Engine:
     def _count_tokens(client: Any, backend: str, text: str) -> int:
         """Count tokens *text* would consume on *backend*'s model.
 
-        GGUF counts exactly via llama-cpp's tokenizer (identical to what
-        ``create_embedding`` sees).  Transformer falls back to a
-        conservative **1 char/token** floor — the densest any BPE gets —
-        so an over-limit text is never let through as "fits"; normal text
-        is unaffected (the conservative bound only over-estimates dense
-        punctuation/escaped-JSON runs, which is the safe direction).
+        GGUF counts exactly via llama-cpp's tokenizer, with the SAME
+        arguments ``Llama.embed`` tokenizes with (``add_bos=True``,
+        ``special=False``) — llama-cpp's own defaults.  Matching them matters
+        at the boundary: a text that tokenizes to exactly ``max_tokens``
+        without the BOS token is one token over once ``embed`` adds it, and
+        that one token would be silently truncated away.
+
+        Transformer falls back to a conservative **1 char/token** floor —
+        the densest any BPE gets — so an over-limit text is never let
+        through as "fits"; normal text is unaffected (the conservative bound
+        only over-estimates dense punctuation/escaped-JSON runs, which is
+        the safe direction).
         """
         if backend == "gguf":
             try:
-                ids = client.tokenize(text, special=False)
+                ids = client.tokenize(text.encode("utf-8"), add_bos=True, special=False)
                 if ids is not None:
                     return len(ids)
             except Exception:  # noqa: BLE001, S110 — fall back to a char count
@@ -499,16 +528,23 @@ class Engine:
         property value or invoke the method, then convert; anything else
         degrades to 0 so the caller keeps its guessed dimension.
         """
-        raw = getattr(client, "n_embd", 0)
-        if callable(raw):
-            try:
-                raw = raw()
-            except Exception:  # noqa: BLE001 — defensive: any probe failure degrades to dim 0
-                raw = 0
-        try:
-            return int(raw or 0)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            return 0
+        return _int_probe(getattr(client, "n_embd", 0))
+
+    @staticmethod
+    def _read_gguf_window(client: Any) -> int:
+        """Read a loaded llama-cpp model's own context window, defensively.
+
+        The model's *trained* window lives on the internal model wrapper
+        (``_model.n_ctx_train()``) — it cannot be known before the weights
+        are loaded, which is why the constructor asks for
+        ``_DEFAULT_N_CTX`` and the real value is read back here.  Asking
+        for fewer tokens than the model was trained on would cap every
+        request below the limit we advertise; asking for more would let
+        llama.cpp truncate at a boundary nothing else knows about.  0 means
+        "unknown" — the caller keeps the requested window.
+        """
+        model = getattr(client, "_model", None)
+        return _int_probe(getattr(model, "n_ctx_train", 0))
 
     async def _load_spec(self, spec: ModelSpec) -> None:
         """Materialise one model into ``_clients[spec.name]``.
@@ -533,8 +569,23 @@ class Engine:
 
             gguf_path = spec.gguf_path
             assert gguf_path is not None  # guaranteed by backend == "gguf"
+            # The context window is capped at the limit this server already
+            # enforces per input, so the two agree.  ``n_batch`` — the size
+            # of ONE sequence llama.cpp will actually evaluate — is set from
+            # the model's real window below, because ``Llama.embed`` silently
+            # slices every tokenized input to ``tokens[:n_batch]`` (truncate
+            # defaults to True).  llama-cpp's own default of 512 would
+            # therefore quietly cut every input longer than 512 tokens while
+            # our max_tokens check reported it as fitting — exactly the
+            # silent data loss this class exists to prevent, and invisible
+            # in the response.
+            n_ctx = min(spec.max_tokens, _DEFAULT_N_CTX)
             logger.info(
-                "loading_gguf name=%s path=%s dim=%d", spec.name, gguf_path, spec.dim
+                "loading_gguf name=%s path=%s dim=%d n_ctx=%d",
+                spec.name,
+                gguf_path,
+                spec.dim,
+                n_ctx,
             )
             Llama = _Llama  # narrow: non-None after the guard above
 
@@ -546,7 +597,8 @@ class Engine:
                 kwargs = {
                     "model_path": gguf_path,
                     "embedding": True,
-                    "n_ctx": 8192,
+                    "n_ctx": n_ctx,
+                    "n_batch": n_ctx,
                     "verbose": False,
                 }
                 if llama_supports_gpu_offload():
@@ -559,6 +611,32 @@ class Engine:
                 _load_gguf,
                 name=f"gguf-load-{spec.name}",
             )
+            # Reconcile the enforced limit with the window the weights report,
+            # so a request can never be accepted at a width llama.cpp will
+            # truncate.  Both directions matter: a model trained on LESS than
+            # we asked for is cut at its own window, and an explicit
+            # ``max_tokens`` above the requested window is cut at ``n_ctx``.
+            # Whatever survives that becomes both the advertised limit and the
+            # batch size, leaving the ceiling honest and the truncation
+            # unreachable.
+            window = self._read_gguf_window(client)
+            effective = min(spec.max_tokens, n_ctx, window) if window else n_ctx
+            if effective < spec.max_tokens:
+                logger.info(
+                    "max_tokens_override name=%s backend=gguf configured=%d "
+                    "model_window=%s effective=%d",
+                    spec.name,
+                    spec.max_tokens,
+                    window or "unknown",
+                    effective,
+                )
+                spec.max_tokens = effective
+            # The constructor already received the same number; this makes the
+            # live instance agree when the window turned out smaller, which is
+            # the only case where the two could differ.  ``n_batch <= n_ctx``
+            # is llama.cpp's own constraint (it clamps the same way), so a
+            # reduced batch never exceeds the context it was built with.
+            client.n_batch = spec.max_tokens
             actual_dim = self._read_model_dim(client)
             self._clients[spec.name] = client
             if actual_dim and actual_dim != spec.dim:

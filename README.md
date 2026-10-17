@@ -38,6 +38,9 @@ them ([Model weights](#model-weights)).
   request that names it (per-model `autoload: true` preloads a specific
   model at startup).
 - **Real dimension** reported after load (a guessed width is never served).
+- **Enforced context limit** — an over-long input is a `400`, never a
+  quietly shortened vector; the limit is reconciled with the window the
+  weights themselves report.
 - Runs standalone, and can also be **loaded as a slife plugin** (see
   [Running as a slife embedding backend](#running-as-a-slife-embedding-backend)).
 
@@ -328,6 +331,11 @@ port: 17347                                # standalone only
 - `models` — map of name → `{backend, gguf_path | model, device, max_tokens, autoload}`.
   Every configured model is a peer; there is **no `active_model`** — each
   request names the model it wants (standard OpenAI semantics).
+- `max_tokens` (per model, default the family's published limit) — the context
+  length the server **enforces**, so an over-long input is a `400` instead of a
+  silently shortened vector.  It is also the width llama.cpp is configured to
+  accept, and is reconciled with the window the weights report (see
+  [Errors](#errors--the-openai-contract)).
 - `autoload` (per model, default `false`) — a model's weights are large and
   memory-hungry, so nothing loads until a request names it (**lazy**).
   `autoload: true` on one model eager-loads just that model in the
@@ -441,6 +449,14 @@ Every error uses the standard envelope
 Split long documents into pieces of at most `max_tokens` tokens client-side
 (slife's semantic drainer does this automatically).
 
+`max_tokens` is the limit the server **enforces**, so it is also the width
+llama.cpp is configured to accept — and it is reconciled with the window the
+weights themselves report, in both directions. A model trained on less than
+the limit is clamped down to its own window; a `max_tokens` set above the
+8 192-token context window is clamped to that window. Whatever the config
+says, `/v1/models` and `/health` report the number actually in force, and a
+request over it is a `400` rather than a quietly shortened vector.
+
 ### `GET /v1/models`
 
 Every configured model, each with its real embedding dimension
@@ -503,15 +519,21 @@ and requests name the one they want.
 | weight ref | `--HF_HUB_CACHE <dir>` — cache must contain the repo | `--path <PATH>` required — existing `.gguf` file |
 | cache fallback | env `HF_HUB_CACHE`, else error | — |
 | env written | `HF_HUB_CACHE` + `HF_HUB_OFFLINE: "1"` (offline server) | — |
-| `--port <n>` | default `17347` | default `17347` |
+| `--port <n>` | omit to keep the configured port | omit to keep the configured port |
 
 ```bash
 local-embed set BAAI/bge-m3 [--HF_HUB_CACHE <dir>] [--port 17347]
 local-embed set-gguf bge-m3 --path D:\models\bge-m3\bge-m3-q8_0.gguf [--port 17347]
 ```
 
-Any error — cache unset, repo not in cache, file missing — exits non-zero and
-writes nothing. Changes apply on the next server start.
+`--port` is a choice, not a rewrite: omitting it keeps whatever port the
+config already pins, and only falls back to `17347` when the config has none.
+Pass it explicitly to move the service — every host's static `base_url`
+points at that port, so a command that only meant to add a model should not
+relocate it.
+
+Any error — cache unset, repo not in cache, file missing, unparseable config
+— exits non-zero and writes nothing. Changes apply on the next server start.
 
 ### Model download — offline by default
 

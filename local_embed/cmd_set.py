@@ -22,7 +22,7 @@ import os
 import sys
 from pathlib import Path
 
-from local_embed.config import load_config, write_config
+from local_embed.config import DEFAULT_PORT, load_config, write_config
 
 ENV_CACHE_KEY = "HF_HUB_CACHE"
 ENV_OFFLINE_KEY = "HF_HUB_OFFLINE"
@@ -131,12 +131,36 @@ def set_gguf_model(cfg: dict, model: str, gguf_path: str, port: int) -> dict:
     return _upsert_model(cfg, model, {"backend": "gguf", "gguf_path": gguf_path}, port)
 
 
+def _effective_port(args, cfg: dict) -> int:
+    """The port to pin: an explicit ``--port`` > the configured one > default.
+
+    Falling back to the bare default would make ``--port`` write-only: both
+    subcommands' flag defaults to :data:`DEFAULT_PORT`, so ``local-embed
+    set-gguf m --path x`` against a config that pinned 9000 would silently
+    rewrite it to 17347 — moving a service every host's static ``base_url``
+    points at, from a command that only meant to add a model.
+    """
+    cli = getattr(args, "port", None)
+    if cli is not None:
+        return int(cli)
+    configured = cfg.get("port")
+    if configured not in (None, ""):
+        return int(configured)
+    return DEFAULT_PORT
+
+
 def _write_model(mutate, rows: list[tuple[str, object]]) -> int:
-    """Load, mutate and atomically write the config; shared result output."""
+    """Load, mutate and atomically write the config; shared result output.
+
+    *mutate* receives the loaded config and returns ``(new_config, resolved
+    port)`` — it reads what the file already says (the port to keep) as well
+    as writing to it, so the printed row reports what was really written.
+    """
     try:
         cfg = load_config()
-        path = write_config(mutate(cfg))
-    except ValueError as e:  # config exists but won't parse
+        updated, port = mutate(cfg)
+        path = write_config(updated)
+    except ValueError as e:  # config exists but won't parse, or path is a dir
         print(f"Error: {e}", file=sys.stderr)
         return 2
     except OSError as e:
@@ -146,6 +170,7 @@ def _write_model(mutate, rows: list[tuple[str, object]]) -> int:
     print("local-embed configured:")
     for label, value in rows:
         print(f"  {label!s:<16}: {value}")
+    print(f"  {'port':<16}: {port}")
     print(f"  {'config':<16}: {path}")
     print("Restart 'local-embed' to apply.")
     return 0
@@ -167,12 +192,15 @@ def run_set(args) -> int:
         )
         return 2
 
+    def _mutate(cfg: dict) -> tuple[dict, int]:
+        port = _effective_port(args, cfg)
+        return set_transformer_model(cfg, args.model, cache, port), port
+
     return _write_model(
-        lambda cfg: set_transformer_model(cfg, args.model, cache, args.port),
+        _mutate,
         rows=[
             ("transformer model", args.model),
             ("HF cache", cache),
-            ("port", args.port),
         ],
     )
 
@@ -183,11 +211,14 @@ def run_set_gguf(args) -> int:
         print(f"Error: gguf file not found: {args.path}", file=sys.stderr)
         return 2
 
+    def _mutate(cfg: dict) -> tuple[dict, int]:
+        port = _effective_port(args, cfg)
+        return set_gguf_model(cfg, args.model, args.path, port), port
+
     return _write_model(
-        lambda cfg: set_gguf_model(cfg, args.model, args.path, args.port),
+        _mutate,
         rows=[
             ("gguf model", args.model),
             ("gguf file", args.path),
-            ("port", args.port),
         ],
     )

@@ -137,17 +137,27 @@ def load_config(path: Path | None = None) -> dict:
     if path is None:
         path = resolve_config_path()
     try:
-        raw = new_yaml().load(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         logger.info("config_not_found path=%s", path)
         return {}
-    except (YAMLError, ValueError, OSError) as e:
+    except OSError as e:
+        logger.error("config_read_error path=%s err=%s", path, e)
+        raise ValueError(f"Cannot read config {path}: {e}") from e
+    try:
+        raw = new_yaml().load(text)
+    except (YAMLError, ValueError) as e:
         logger.error("config_parse_error path=%s err=%s", path, e)
         raise ValueError(f"Cannot parse config {path}: {e}") from e
     # An empty file loads as None and a top-level list as a sequence; neither is
     # a usable config, and both are surfaced rather than silently becoming {}.
+    # ValueError (not TypeError) so every caller's existing ``except ValueError``
+    # — cmd_set and the CLI — renders it as one actionable line instead of a
+    # traceback.
     if not isinstance(raw, dict):
-        raise TypeError(f"Cannot parse config {path}: not a mapping")
+        raise ValueError(  # noqa: TRY004 — the callers catch ValueError, see above
+            f"Cannot parse config {path}: not a mapping"
+        )
     return raw
 
 

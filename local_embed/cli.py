@@ -14,6 +14,9 @@ Entry paths share this module:
   configure a gguf model in ``local_embed.yaml`` (idempotent; ``--path``
   must point at an existing ``.gguf`` file).
 
+Both subcommands leave the configured ``port`` alone unless ``--port`` is
+given explicitly — see :func:`local_embed.cmd_set._effective_port`.
+
 - ``python -m local_embed.server``: the **plugin spawn target** used by a
   host (slife) — binds a free port, serves MCP on ``/mcp`` and embeddings
   on the same port, and signals the parent.  That path lives in
@@ -66,8 +69,11 @@ def build_parser() -> argparse.ArgumentParser:
     set_p.add_argument(
         "--port",
         type=int,
-        default=DEFAULT_PORT,
-        help=f"port the server binds (default {DEFAULT_PORT})",
+        default=None,
+        help=(
+            f"port the server binds (default: keep the configured port, "
+            f"else {DEFAULT_PORT})"
+        ),
     )
 
     gguf_p = sub.add_parser(
@@ -92,8 +98,11 @@ def build_parser() -> argparse.ArgumentParser:
     gguf_p.add_argument(
         "--port",
         type=int,
-        default=DEFAULT_PORT,
-        help=f"port the server binds (default {DEFAULT_PORT})",
+        default=None,
+        help=(
+            f"port the server binds (default: keep the configured port, "
+            f"else {DEFAULT_PORT})"
+        ),
     )
     return p
 

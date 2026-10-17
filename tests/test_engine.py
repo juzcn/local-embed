@@ -6,6 +6,9 @@ load, dim override, thread-serialisation, row alignment, multi-model).
 """
 
 import asyncio
+import sys
+import types
+from contextlib import contextmanager
 
 import pytest
 
@@ -439,3 +442,111 @@ class TestMultiModel:
             )
             with pytest.raises(KeyError, match="unknown model"):
                 await e.embed(["hello"], "typo")
+
+
+# ── GGUF context window / batch size ──────────────────────────────────────
+
+
+class TestGgufContextWindow:
+    """``Llama.embed`` silently slices each input to ``tokens[:n_batch]``
+    (``truncate`` defaults True), and llama-cpp's own ``n_batch`` default is
+    512 — so a 2000-token document that the engine's ``max_tokens`` check
+    accepted would be embedded as its first 512 tokens with no error.  The
+    engine must size ``n_batch`` from the window it enforces, and reconcile
+    both with the window the weights report."""
+
+    def _engine(self, name="bge-m3", window: int | None = 8192, **kw):
+        """An Engine plus the fake ``Llama`` whose call records the kwargs.
+
+        ``run_daemon`` is patched to run the loader's body inline, so
+        ``Llama(**kwargs)`` really executes and ``Llama.call_args`` carries
+        the constructor arguments — that is what these tests assert on.
+        """
+        llama = MagicMock()
+        client = MagicMock()
+        client.n_embd = MagicMock(return_value=1024)
+        client._model = MagicMock()
+        client._model.n_ctx_train = MagicMock(return_value=window)
+        client.tokenize = MagicMock(return_value=list(range(10)))
+        client.create_embedding = MagicMock(
+            return_value={"data": [{"embedding": [0.1] * 1024}]}
+        )
+        llama.side_effect = lambda **kwargs: client
+
+        fake_backend = types.ModuleType("llama_cpp")
+        fake_backend.llama_supports_gpu_offload = lambda: False  # type: ignore[attr-defined]
+        engine = Engine(backend="gguf", model=name, gguf_path="/m.gguf", **kw)
+        return (
+            engine,
+            llama,
+            client,
+            patch.dict(sys.modules, {"llama_cpp": fake_backend}),
+        )
+
+    @contextmanager
+    def _load(self, llama, backend):
+        """Patch the backend in and run the loader's body inline.
+
+        Yields the ``run_daemon`` mock; the real constructor body still runs,
+        so ``Llama(**kwargs)`` executes and ``Llama.call_args`` carries what
+        the engine actually asked llama-cpp for.
+        """
+        with (
+            patch("local_embed.engine._Llama", llama),
+            backend,
+            patch("local_embed.engine.run_daemon", new_callable=AsyncMock) as mock_run,
+        ):
+            mock_run.side_effect = lambda fn, name="daemon": fn()
+            yield mock_run
+
+    @pytest.mark.asyncio
+    async def test_n_batch_matches_n_ctx_not_the_llama_default(self):
+        engine, llama, _client, backend = self._engine()
+        with self._load(llama, backend):
+            await engine.ensure_loaded("bge-m3")
+        kwargs = llama.call_args.kwargs
+        assert kwargs["n_ctx"] == 8192
+        # Never llama-cpp's 512 default: that is the silent-truncation width.
+        assert kwargs["n_batch"] == kwargs["n_ctx"] == 8192
+
+    @pytest.mark.asyncio
+    async def test_explicit_max_tokens_cannot_exceed_the_window(self):
+        """A ``max_tokens`` above the window we asked llama.cpp for would let
+        inputs past that llama.cpp then cuts — clamp it to the window."""
+        engine, llama, _client, backend = self._engine(window=32768, max_tokens=32000)
+        with self._load(llama, backend):
+            await engine.ensure_loaded("bge-m3")
+        assert engine.model_spec("bge-m3").max_tokens == 8192
+        kwargs = llama.call_args.kwargs
+        assert kwargs["n_batch"] == kwargs["n_ctx"] == 8192
+
+    @pytest.mark.asyncio
+    async def test_window_smaller_than_limit_wins(self):
+        """A model trained on less than we asked for is cut at its own
+        window — the advertised limit must come down to match it."""
+        engine, llama, _client, backend = self._engine(name="bge-large", window=512)
+        with self._load(llama, backend):
+            await engine.ensure_loaded("bge-large")
+        spec = engine.model_spec("bge-large")
+        assert spec.max_tokens == 512
+        assert llama.call_args.kwargs["n_ctx"] == 512
+
+    @pytest.mark.asyncio
+    async def test_window_unknown_keeps_the_requested_limit(self):
+        """No usable ``n_ctx_train`` (older llama-cpp, or a probe failure)
+        must not shrink the limit to zero — fall back to what we asked for."""
+        engine, llama, _client, backend = self._engine(window=None)
+        with self._load(llama, backend):
+            await engine.ensure_loaded("bge-m3")
+        assert engine.model_spec("bge-m3").max_tokens == 8192
+
+    @pytest.mark.asyncio
+    async def test_tokenize_matches_how_embed_tokenizes(self):
+        """The count must include the BOS token ``embed`` adds, or a text that
+        tokenizes to exactly ``max_tokens`` is one over once encoded."""
+        engine, llama, client, backend = self._engine()
+        with self._load(llama, backend):
+            await engine.embed(["hello"], "bge-m3")
+        args, kwargs = client.tokenize.call_args
+        assert args[0] == b"hello"  # exact bytes llama-cpp tokenizes
+        assert kwargs == {"add_bos": True, "special": False}

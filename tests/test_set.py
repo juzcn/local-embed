@@ -271,3 +271,71 @@ class TestCliStartupWarnings:
         monkeypatch.setattr("local_embed.server.serve_standalone", lambda *a, **k: 0)
         code = main([])
         assert code == 0
+
+
+class TestPortPreservation:
+    """``--port`` must be a choice, not a rewrite.  Both subcommands' flag
+    defaulted to DEFAULT_PORT, so omitting it silently moved a service every
+    host's static ``base_url`` points at."""
+
+    def _gguf_file(self, tmp_path):
+        gguf = tmp_path / "bge.gguf"
+        gguf.write_text("GGUF", encoding="utf-8")
+        return gguf
+
+    def test_set_keeps_an_existing_port_when_flag_omitted(
+        self, tmp_path, config_path, monkeypatch
+    ):
+        cache = tmp_path / "hub"
+        (cache / "models--BAAI--bge-m3").mkdir(parents=True)
+        write_config({"port": 9000}, config_path)
+        monkeypatch.setenv(ENV_CACHE_KEY, str(cache))
+
+        assert main(["set", "BAAI/bge-m3"]) == 0
+        cfg = load_config(config_path)
+        assert cfg["port"] == 9000
+        assert cfg["env"][ENV_CACHE_KEY] == str(cache)
+
+    def test_set_gguf_keeps_an_existing_port_when_flag_omitted(
+        self, tmp_path, config_path
+    ):
+        gguf = self._gguf_file(tmp_path)
+        write_config({"port": 9000}, config_path)
+
+        assert main(["set-gguf", "bge-m3", "--path", str(gguf)]) == 0
+        assert load_config(config_path)["port"] == 9000
+
+    def test_explicit_port_flag_still_wins(self, tmp_path, config_path):
+        gguf = self._gguf_file(tmp_path)
+        write_config({"port": 9000}, config_path)
+
+        assert main(["set-gguf", "bge-m3", "--path", str(gguf), "--port", "9500"]) == 0
+        assert load_config(config_path)["port"] == 9500
+
+    def test_default_port_when_config_has_none(self, tmp_path, config_path):
+        gguf = self._gguf_file(tmp_path)
+        assert main(["set-gguf", "bge-m3", "--path", str(gguf)]) == 0
+        assert load_config(config_path)["port"] == 17347
+
+
+class TestMalformedConfig:
+    """A config that is valid YAML but not a mapping must exit 2 with one
+    actionable line — ``load_config`` raised TypeError, which neither
+    ``_write_model`` nor the CLI's ``except ValueError`` caught, so the user
+    got a traceback from a command documented to write nothing and report."""
+
+    def test_non_mapping_config_is_a_clean_error(self, config_path, capsys):
+        config_path.write_text("- a\n- b\n", encoding="utf-8")
+        gguf = config_path.parent / "bge.gguf"
+        gguf.write_text("GGUF", encoding="utf-8")
+
+        code = main(["set-gguf", "bge-m3", "--path", str(gguf)])
+        assert code == 2
+        err = capsys.readouterr().err
+        assert "not a mapping" in err
+        # The broken config is left exactly as it was.
+        assert config_path.read_text(encoding="utf-8") == "- a\n- b\n"
+
+    def test_empty_config_file_is_not_an_error(self, config_path):
+        """An empty file loads as None — ``{}``, not a crash."""
+        assert load_config(config_path) == {}
