@@ -1,28 +1,31 @@
 # local-embed
 
-**一个独立的本地 embedding 服务。** 它加载一个本地 GGUF
-（llama-cpp）或 HF transformer embedding 模型，并把它暴露为一个
+**一个独立的本地 embedding 服务。** 在自己的机器上运行它，把任何 OpenAI 兼容客户端指向它，
+即可用自己的模型生成 embedding —— 不需要 API key，不出网，没有按 token 计费。
+
+```bash
+local-embed set-gguf bge-m3 --path D:\models\bge-m3.gguf   # 配置一个模型
+local-embed                                                # 启动服务
+curl http://127.0.0.1:17347/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "bge-m3", "input": "hello world"}'
+```
+
+它加载本地 **GGUF**（llama-cpp）和/或 **HF transformer**（sentence-transformers）
+模型，并作为
 [OpenAI 兼容](https://platform.openai.com/docs/api-reference/embeddings)
-的 `/v1/embeddings` URL —— 任何 OpenAI 兼容客户端都能通过它为文本生成 embedding。
+的 `/v1/embeddings` API 提供服务。服务器从不下载权重——由你预先下载
+（见[模型权重](#模型权重)）。
 
-在一个端口上它提供两套接口：用于 embedding 的 OpenAI 兼容 `/v1/*` API，以及位于 `/mcp` 的 Streamable HTTP MCP 端点。
-
-local-embed 同时是三样东西：一个独立应用、一个 Streamable HTTP
-**MCP 服务器**（见[作为 MCP 服务器](#作为-mcp-服务器)），以及一个符合规范的
-**slife 插件**（见[作为 slife 嵌入后端运行](#作为-slife-嵌入后端运行)）。
-产品是那个 embedding URL；MCP 和插件接口是宿主用来管理这同一个独立服务的方式。
-
-两种后端：**`gguf`** 加载本地 `.gguf` 文件（llama-cpp-python）；
-**`transformer`** 从本地 hub 缓存加载 HF repo id
-（sentence-transformers）。服务器从不下载权重——由你预先下载
-（[模型权重](#模型权重)）。
+在同一端口上它还提供 `/v1/models`、`/health`，以及位于 `/mcp` 的 Streamable HTTP MCP 端点
+（见[作为 MCP 服务器](#作为-mcp-服务器)）。
 
 ```
    any OpenAI-compatible client ──┐
-   slife (memdb / memfiles) ──────┤── POST /v1/embeddings ──┐
-   vector DB / RAG pipeline ──────┘                          ▼
+   an editor / agent / pipeline ──┤── POST /v1/embeddings ──┐
+   a RAG indexer ─────────────────┘                          ▼
                                               ┌───────────────────────┐
-   slife (plugin host) ─── /mcp ────────────> │       local-embed     │
+   MCP client ─────────── /mcp ─────────────> │      local-embed      │
                                               │  models load on demand │
                                               └───────────────────────┘
 ```
@@ -34,16 +37,19 @@ local-embed 同时是三样东西：一个独立应用、一个 Streamable HTTP
 - **懒加载**——启动很快；每个模型在第一个指名它的请求到来时才实体化（按模型设置的 `autoload: true` 会在启动时预加载指定模型）。
 - 加载后报告**真实维度**（绝不把猜出来的宽度当作结果提供）。
 - **强制执行上下文上限**——超长输入得到 `400`，而不是一个被悄悄剪短的向量；该上限会与权重自己报告的窗口对齐。
-- 可独立运行，也能**作为 slife 插件被加载**（见[作为 slife 嵌入后端运行](#作为-slife-嵌入后端运行)）。
+- **完全离线**——没有遥测，运行时不下任何东西，不需要 API key。
 
 需要 Python ≥ 3.13。
 
 ## 安装
 
-核心包是 `fastmcp` + `starlette` + `ruamel.yaml`（round-trip YAML——
-保留注释的配置解析器）。模型后端按下面的平台矩阵分别安装。
+两步：先装应用，再装你想要的那个模型后端。应用就是一个普通的 Python 包；
+后端是**故意**不打包进来的——每一次真实安装都需要某个按平台选择的索引或
+`CMAKE_ARGS`，而包 extra 承载不了这些（见[平台矩阵](#gguf-后端平台矩阵)）。
 
-一键安装脚本（必要时先装 `uv`，再运行 `uv tool install --force --python '>=3.13' local-embed`——**不**包含后端，见下文）：
+### 1. 应用
+
+**一键安装**（必要时先装 `uv`，再把应用装进它自己独立的工具环境）：
 
 ```bash
 # macOS / Linux / WSL
@@ -53,48 +59,55 @@ curl -fsSL https://raw.githubusercontent.com/juzcn/local-embed/main/install.sh |
 powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/juzcn/local-embed/main/install.ps1 | iex"
 ```
 
-手动安装等价：
+**或者手动安装**——安装脚本做的就是这件事：
 
 ```bash
-# the app + CLI (standalone tool)
 uv tool install --force --python '>=3.13' local-embed
 ```
 
-后端**不属于**这个包——没有 extras，因为每一次真实安装都需要某个按平台选择的索引或 `CMAKE_ARGS`，而 extra 承载不了这些。用 `uv pip install --python "$(uv tool dir)/local-embed" …` 加上它，按下方的矩阵操作。
+> `--python '>=3.13'` 不是可选项。没有它，`uv` 会按自己偏好的解释器来构建工具环境；
+> 而 local-embed 需要 ≥ 3.13，所以旧环境里根本没有任何可安装的兼容版本。加上这个约束后，
+> uv 会去取一个合适的解释器，或者大声报错。
 
-`--force`（安装脚本也用它）是**幂等**的——首次运行安装，重跑会**更新**到最新的 PyPI 发布版。不带 `--force` 的 `uv tool install local-embed` 在工具已安装时是空操作。
+`--force`（安装脚本也用它）是**幂等**的——首次运行安装，重跑会**更新**到最新发布版。
+不带 `--force` 的 `uv tool install local-embed` 在工具已安装时是空操作。
 
-如果你是在一个*已有*环境里（与另一个工具并存）运行 local-embed，请把后端装进**那个**环境的解释器，而不是另建一个。
+这样你就得到了一个在 PATH 上的 `local-embed` 命令，它处在一个只装了这一个应用的隔离环境里。
+`uv tool uninstall local-embed`（或 `uninstall.sh` / `uninstall.ps1`）会移除它，并保留你的配置。
 
-这里没有什么需要查的，也没有 `bin/` 与 `Scripts/` 之争：uv 接收 venv 的**根目录**，自己从中找到解释器，而 `uv tool dir` 打印的是容纳所有工具 venv 的那个根目录。所以设置一次目标并复用：
+### 2. 模型后端
+
+把后端装进应用自己运行的那个环境。uv 接收 venv 的**根目录**并自己从中找到解释器，
+所以设置一次目标并复用——`uv tool dir` 打印的就是容纳所有工具 venv 的那个根目录：
 
 ```bash
-PY="$(uv tool dir)/local-embed"   # installed by the installers above
-PY="$(uv tool dir)/slife"         # running as slife's embedding backend
-PY=.venv                          # a project checkout (run from its root)
+PY="$(uv tool dir)/local-embed"   # 由第 1 步安装
 ```
-
-选出与你安装方式匹配的那一行，然后 `uv pip install --python "$PY"
-llama-cpp-python`——下方的矩阵用的是同一个 `$PY`。
-
-**这里的每个命令块都是 POSIX shell**（`bash` / `zsh` / WSL）。在 Windows
-PowerShell 上，同样的两件事写法不同，其余一律不变：变量赋值，以及为单条命令设置环境变量的 `VAR=value command` 前缀。
 
 ```powershell
-$PY = "$(uv tool dir)\slife"          # the same target, PowerShell syntax
-$env:CMAKE_ARGS = "-DGGML_CUDA=on"    # then run the uv pip install on its own line
+$PY = "$(uv tool dir)\local-embed"   # 同一个目标，PowerShell 写法
 ```
 
-你运行的那种安装决定用哪一行：
+然后按下方矩阵安装，例如 `uv pip install --python "$PY" llama-cpp-python`。
+从这里往后，所有命令都用同一个 `$PY`。
 
-- **工具安装**——`uv tool install local-embed` 以及上面的安装脚本落在 uv 的工具 venv 里。当 local-embed 作为 slife 的 embedding 后端运行时，提供服务的进程是 slife 的，所以后端属于 slife 的工具 venv（`install.sh` / `install.ps1` 装的是 slife）。新来一次 `uv tool install
-  local-embed` *不是*解决办法——它构建的是一个独立的工具，而不是正在提供服务的那个环境。
-- **项目检出**——该检出的 `.venv`。
-- **正在运行的服务器**——缺少的后端会在启动时报错，并给出确切的命令，其中包含它自己的解释器。
+> 如果你不是用工具安装，而是在一个*已有*环境里运行 local-embed（某个项目检出的 `.venv`，
+> 或另一个应用的环境），就把后端装进**那个**环境的解释器。只有当目标明确时 `--python`
+> 才是可选的：uv 按 `--python` > `$VIRTUAL_ENV` > 当前目录（向上回溯）的 `.venv` 顺序解析，
+> 一个都找不到就报错——venv 绝不会被隐式创建。
 
-只有当目标明确时 `--python` 才是可选的：uv 按 `--python` > `$VIRTUAL_ENV` > 当前目录（向上回溯）的 `.venv` 顺序解析，一个都找不到就报错——venv 绝不会被隐式创建。只要涉及不止一个 venv，就显式给出它。
+**这里的每个命令块都是 POSIX shell**（`bash` / `zsh` / WSL）。在 Windows
+PowerShell 上，同样的两件事写法不同，其余一律不变：变量赋值，以及为单条命令设置环境变量的
+`VAR=value command` 前缀。
 
-venv 是**平台绑定**的：Windows 创建的 `.venv`（`Scripts\`、`Lib\`）没有 `bin/python`，无法从 WSL 或 Linux 容器使用。把 Linux venv 放在 Linux 文件系统上（`~/venvs/local-embed`），不要在位于 Windows 盘符上的检出目录里创建它——第二次 `uv venv` 会重写 `pyvenv.cfg`，把 Windows 那个弄坏。
+```powershell
+$env:CMAKE_ARGS = "-DGGML_CUDA=on"    # 然后单独一行运行 uv pip install
+```
+
+venv 是**平台绑定**的：Windows 创建的 `.venv`（`Scripts\`、`Lib\`）没有 `bin/python`，
+无法从 WSL 或 Linux 容器使用。把 Linux venv 放在 Linux 文件系统上（`~/venvs/local-embed`），
+不要在位于 Windows 盘符上的检出目录里创建它——第二次 `uv venv` 会重写 `pyvenv.cfg`，
+把 Windows 那个弄坏。
 
 ### `gguf` 后端——平台矩阵
 
@@ -211,7 +224,7 @@ uv pip install --python "$PY" sentence-transformers llama-cpp-python
 
 ## 快速开始
 
-1. **安装**应用和一个后端（见上文）。
+1. **安装**应用，再安装一个后端——见[安装](#安装)的第 1、2 步。
 2. **下载权重**——见[模型权重](#模型权重)。
 3. **配置一个模型**——CLI 辅助命令会写出 `local_embed.yaml`：
 
@@ -351,7 +364,8 @@ OpenAI 禁止空字符串输入，所以批次里的空字符串/纯空白字符
 | `503` | `server_error` | 该模型的引擎**仍在加载**（is_loading——稍后重试）或不可用（后端依赖缺失、加载失败） | — |
 | `500` | `server_error` | 意外的内部故障 | — |
 
-在客户端把长文档切成不超过 `max_tokens` 个 token 的片段（slife 的语义 drainer 会自动做这件事）。
+在客户端把长文档切成不超过 `max_tokens` 个 token 的片段——local-embed 会拒绝超长输入，
+而不是只嵌入它的前缀。
 
 `max_tokens` 是服务器**实际执行**的上限，因此也是 llama.cpp 被配置为接受的宽度
 ——并且会与权重自己报告的窗口双向对齐。模型实际训练窗口小于该上限时会被压到它自己的窗口；
@@ -386,21 +400,21 @@ client = OpenAI(base_url="http://127.0.0.1:17347/v1", api_key="local")
 vecs = client.embeddings.create(model="bge-m3", input=["hello"])
 ```
 
-## CLI（辅助工具）
+## CLI
 
-`local-embed` CLI 是个**辅助工具**，不是产品本身：它启动服务并写配置文件。服务由
-`local_embed.yaml` 配置、通过 HTTP API 使用——CLI 只是让这两步更省事。
+`local-embed` 命令就是你运行应用、书写配置的方式。服务由 `local_embed.yaml` 配置、
+通过 HTTP API 使用——CLI 只是让这两步更省事，它本身不接受任何模型或端点参数。
 
 ### `local-embed`——运行服务
 
 ```bash
-local-embed                 # binds 127.0.0.1:17347 by default
+local-embed                 # 默认绑定 127.0.0.1:17347
 ```
 
 CLI 不接受任何模型/端点相关参数——配置是唯一的真相来源。端口已被占用是硬错误，
 只给一行可操作的提示（不会静默退回到某个空闲端口）：停掉另一个实例，或改配置里的
-`port`。在服务已占住端口时运行 CLI 是个值得报出来的错误——同样的情形在 slife
-拉起插件时处理方式不同（见[接管正在运行的服务](#接管正在运行的服务)）。
+`port`。在服务已占住端口时运行 CLI 是个值得报出来的错误——*拉起* local-embed 的宿主
+对同样情形的处理方式不同（见[作为其他应用的嵌入后端](#作为其他应用的嵌入后端)）。
 
 ### `local-embed set` / `set-gguf`——写配置
 
@@ -478,36 +492,26 @@ claude mcp add --transport http local-embed http://127.0.0.1:17347/mcp
 OpenAI 兼容的 `/v1/*` API。只会说 stdio 的客户端可以通过 stdio→HTTP 桥接（例如
 `mcp-remote`）访问它。
 
-## 作为 slife 嵌入后端运行
+## 作为其他应用的嵌入后端
 
-local-embed 是一个**插件**——slife 中央插件规格里的一行，所以 slife 会拉起它、监视它，并像对待其他所有子插件一样汇报它。它也可以独立运行（PATH 上的
-`local-embed`），CLI 正是为此而设；slife 仍然纯粹把 MODEL SERVICE 当作一个
-OpenAI 兼容的 HTTP 端点来消费（绝不通过 MCP 工具）。
+local-embed 是一个应用，不是一个库——没有任何东西 import 它。任何会说 OpenAI Embeddings API
+的东西都能消费它，包括把 local-embed 作为子进程拉起的宿主进程。整个集成就这么多：把下面的
+`base_url` 交给消费方即可。
 
-由于其配置固定了一个端口，而某个静态 embeddings `base_url` 指向它，它是唯一一个端口**固定**的插件：它自己绑定那个端口，而那个端口就是服务的身份——在所有宿主看来，谁占着这个端口，*谁就是* local-embed。
+因为消费方的 `base_url` 是静态配置，local-embed 绑定的是一个**固定**端口（默认 `17347`），
+而不是由系统分配的端口——端口就是服务的身份：在每一个消费方看来，谁占着它，*谁就是* local-embed。
+由此有两点值得知道：
 
-因此第二个实例并不自动等同于错误。当 slife 拉起插件并发现已经有一个 local-embed
-在服务该端口（WSL 里被多个宿主共享的守护进程，或者你手动启动的一个），子进程会
-**接管**它而不是失败；见下文。同一个端口被任何*不是* local-embed 的东西占着则仍然是硬错误，会给出原因，且正在运行的服务不会被触碰。
+- **端口已被服务占用是硬错误。** 其它东西占着 `17347` 时启动 CLI 会以一行可操作的提示失败，
+  而不会静默换一个端口——那样对所有指向这里的消费方都是不可见的。停掉另一个实例，
+  或改 `local_embed.yaml` 里的 `port`。
+- **一个服务，多个消费方。** 多个应用（或 WSL + Windows 上的多台机器）可以指向同一个正在运行的
+  local-embed，而不必各自持有一份约 2 GB 的模型副本。
 
-### 接管正在运行的服务
+### 示例：slife
 
-被拉起的子进程在开始服务之前，先在配置的端口上探测 `GET /health`：
-
-- **有 local-embed 应答** → 它被接管。子进程在一个由 OS 分配的端口上提供 MCP，
-  **自己不加载任何模型**，其 `__check` 报告被接管服务的事实（每次探测都重新读取，所以一个停止应答的服务会被读作*不可用*，而不是过时的好消息）。宿主的
-  `base_url` 本就一直被服务着——由一个很可能已经预热的实例。
-- **没有东西应答，或者应答的是别的东西** → 子进程绑定该端口并照常提供服务；陌生的东西仍然会大声失败，而不会被接管。
-
-接管是自动的，无需配置。正是它让共享一个服务变得可行：Windows 上的 slife 和
-WSL 上的 jack 可以同时指向同一个 local-embed，而不必各自持有一份约 2 GB
-的模型副本。
-
-接管方还会**监视**：如果被接管的服务消失了，子进程会接过这个固定端口、自己提供
-embedding，并预热标了 `autoload` 的模型，这样宿主无需重启也能继续生成
-embedding。反过来则不可能——一旦子进程占住了端口，原来的服务就无法回来，直到子进程重启。
-
-把 slife 的 embedding 配置指向守护进程稳定的端口：
+slife 把 local-embed 作为插件拉起，并通过 HTTP 消费它——与任何其他客户端用的是同一个
+OpenAI 兼容端点。把它的 embedding 配置指向那个稳定端口：
 
 ```yaml
 embeddings:
@@ -520,12 +524,15 @@ embeddings:
   enabled: true
 ```
 
-slife 把每个 embedding 模型都当作远程 OpenAI 兼容端点——local-embed 就是这样一个端点。请求命中的模型由调用方指名；当配置没有指名模型时，slife 在加载时从
-`GET /v1/models`（第一项）发现它。当守护进程不可达时，slife 会优雅降级到关键词搜索（`system_health` 中的 `check_embeddings` 探测**当前生效**提供方的 HTTP
-端点并报告其不可达——它从不假定该提供方就是 local-embed）。
+slife 把每个 embedding 模型都当作远程 OpenAI 兼容端点——local-embed 就是这样一个端点。
+请求命中的模型由调用方指名；当配置没有指名模型时，slife 在加载时从 `GET /v1/models`
+（第一项）发现它。当服务不可达时，slife 会优雅降级到关键词搜索。
 
-它仍然提供的 MCP 接口是内部的 **`__check`**（引擎状态：模型列表、维度、加载状态）——一个供直接探测的服务提供方门面，而不是 slife 插件契约。它还在同一端口上通过 `@mcp.custom_route` 提供普通的 OpenAPI 路由（`/v1/embeddings`、
-`/v1/models`、`/health`）——一个端口，两套协议，无需 slife 参与。
+当 slife 拉起插件并发现已经有一个 local-embed 占着该端口时（被多个宿主共享的守护进程，
+或者你手动启动的一个），被拉起的子进程会**接管**它而不是失败：子进程在一个由系统分配的
+端口上提供 MCP，自己不加载任何模型，其 `__check` 报告的是被接管服务的事实。正在运行的那个
+实例继续提供服务。接管方还会站岗——如果被接管的服务消失了，子进程会接过这个固定端口、
+自己提供 embedding，于是消费方无需重启就能继续生成 embedding。
 
 ---
 
@@ -533,16 +540,20 @@ slife 把每个 embedding 模型都当作远程 OpenAI 兼容端点——local-e
 
 | 现象 | 解决办法 |
 |---------|-----|
-| 日志：`backend_unavailable … reason=llama_cpp_not_installed` / `sentence_transformers_not_installed` | 运行上文*安装*一节中你所在平台的安装命令——日志会打印确切的命令。 |
+| 日志：`backend_unavailable … reason=llama_cpp_not_installed` / `sentence_transformers_not_installed` | 运行上文*安装*第 2 步中你所在平台的安装命令——日志会打印确切的命令，其中包含它自己的解释器。 |
 | Transformer 路线在 `HF_HUB_OFFLINE=1` 下无法加载 | 该 repo 不在缓存里——运行 `hf download BAAI/bge-m3`，并确保 `HF_HUB_CACHE` 指向存放它的那个缓存。 |
-| GGUF 路线无法加载 | `gguf_path` 处的文件缺失——检查 `BGE_M3_GGUF_PATH` / `gguf_path`，并确认客户端请求的是 `"bge-m3"`（所有已配置的模型地位平等——没有任何东西被 `active_model` 挡在门后）。 |
-| `system_health` 显示 `embeddings` 为 `unavailable` | 当前生效的 embedding 端点没有应答 `GET /v1/models`。如果那个提供方是 `local_embed`，请检查同一份报告里的 `local-embed` 那一行——slife 自己会启动该服务，所以它缺失意味着插件启动失败（其日志里有原因；一个**非** local-embed 的服务占着 17347 端口也会导致这种情况）。否则去修云服务提供方的 key：`api_key` 按 `${VAR}` → 环境变量 → credstore 的顺序解析。该组件只探测**当前生效**的提供方，且它的那一行以该提供方的 id 为键。 |
-| 第一次 embedding 非常慢 | transformer 的下载/预热被推迟到第一次 embedding；之后的调用很快。 |
+| GGUF 路线无法加载 | `gguf_path` 处的文件缺失——检查 `local_embed.yaml` 里的路径，并确认客户端请求的是已配置的模型 id（`GET /v1/models` 会列出它们；所有已配置的模型地位平等——没有任何东西被 `active_model` 挡在门后）。 |
+| 启动时 `Error: cannot bind 127.0.0.1:17347` | 端口已被占用。如果占着它的是另一个 local-embed，它已经在提供服务了——把客户端指向它，或者把它停掉。如果是别的服务，就改 `local_embed.yaml` 里的 `port`。 |
+| embedding 看起来不对 / 过短的文档被匹配上 | 输入超过了模型的上下文窗口。查看 `GET /v1/models` 里该模型的 `max_tokens`——生效的上限就是模型真实的窗口，而超长输入得到的是 `400`，绝不是一个被静默截断的向量。 |
+| 第一次 embedding 非常慢 | 模型权重正在第一个指名它的请求上加载（transformer 还会做预热）。给该模型设 `autoload: true` 可改为在启动时预热。 |
 
-## 重新添加后端（手动安装）
+## 重新添加后端（升级之后）
+
+`uv tool install --force`（安装脚本和更新时执行的就是它）会重建工具环境，从而
+**丢掉**这样加进去的后端——升级后请重新执行[安装](#安装)第 2 步里的 `uv pip install`。
 
 后端**不是**包的 extras——每一次真实安装都需要按平台做选择（某个 PyTorch 索引、
-`CMAKE_ARGS`，或上游的 Windows wheel 索引）。直接安装该包；上文*安装*下的平台矩阵才是判断你的平台需要哪条命令的权威依据：
+`CMAKE_ARGS`，或上游的 Windows wheel 索引），所以上文的平台矩阵才是判断你的平台需要哪条命令的权威依据：
 
 | 后端 | 包 | 开销 |
 |---------|---------|------|
@@ -550,19 +561,17 @@ slife 把每个 embedding 模型都当作远程 OpenAI 兼容端点——local-e
 | Transformer | `sentence-transformers` | 约 2 GB + 模型 |
 
 ```bash
-# a tool install (the installers) — into the tool's own venv:
+# 装进应用自己的工具 venv（第 1 步的工具安装）：
 uv pip install --python "$(uv tool dir)/local-embed" llama-cpp-python
 uv pip install --python "$(uv tool dir)/local-embed" sentence-transformers
 
-# uvx / git checkout — there is no tool venv; add the package to the ephemeral env:
+# 或者从一个没有工具 venv 的检出运行——加到临时环境里：
 uvx --with llama-cpp-python --from git+https://github.com/juzcn/local-embed.git local-embed
 ```
 
 在 Windows 上加上 `--extra-index-url …/whl/cpu`（或 `…/whl/cu124`），并为
 Linux/Metal GPU 构建加 `CMAKE_ARGS`；在没有 GPU 的 Linux 机器上先安装 CPU 版
-`torch`——第 1 步的条目给出了两者。遗留的进程内 embedding 后端用的是同样的这两个包，所以这同样覆盖了它们。
-
-重跑安装脚本会重建工具环境（`uv tool install --force`），**会丢掉**这样加上的后端——升级后请重新执行上面的 `uv pip install`。
+`torch`——平台矩阵给出了两者。
 
 ## 开发
 
@@ -583,7 +592,7 @@ CI 在 Windows、macOS、Linux 上跑测试（`.github/workflows/ci.yml`），�
 改 `pyproject.toml` 里的 `version`，提交，然后推一个同名 tag：
 
 ```bash
-git tag -a v0.3.1 -m "local-embed 0.3.1" && git push origin v0.3.1
+git tag -a v0.4.0 -m "local-embed 0.4.0" && git push origin v0.4.0
 ```
 
 `.github/workflows/publish.yml` 会校验 tag 与包版本完全一致，不一致直接失败；通过后经 trusted publishing 上传到 PyPI。

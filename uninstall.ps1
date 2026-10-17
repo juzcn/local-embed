@@ -63,7 +63,7 @@ if (Test-Path $embedDir) {
 }
 
 Write-Host ""
-Write-Dim "Model weights under ~\.cache\huggingface are shared with other tools"
+Write-Dim "Model weights under ~\.cache\huggingface\hub are shared with other tools"
 Write-Dim "and are never touched by this script."
 Write-Host ""
 Write-Host "Done." -ForegroundColor Cyan

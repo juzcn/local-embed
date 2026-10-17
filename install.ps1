@@ -33,7 +33,7 @@ Write-Host "local-embed Installer" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Install method : uv tool install --force (isolated environment; re-run = update)"
 Write-Host "User data      : ~\.local-embed\local_embed.yaml (config)"
-Write-Host "Model cache    : ~\.cache\huggingface (pre-downloaded weights)"
+Write-Host "Model cache    : ~\.cache\huggingface\hub (pre-downloaded weights)"
 Write-Host "Python         : 3.13+ (managed by uv)"
 Write-Host ""
 
@@ -79,7 +79,9 @@ if ($userPath -notlike "*$localBin*") {
 
 Write-Host ""
 Write-Warn "The embedding backend is NOT installed.  It is a per-platform install —"
-Write-Warn "the command differs by OS and GPU.  See the matrix in local-embed\README.md."
+Write-Warn "the command differs by OS and GPU:"
+Write-Host ""
+Write-Host "  https://github.com/juzcn/local-embed#2-a-model-backend"
 Write-Host ""
 Write-Host "local-embed installed successfully!" -ForegroundColor Green
 Write-Host ""

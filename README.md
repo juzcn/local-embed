@@ -1,30 +1,32 @@
 # local-embed
 
-**A standalone local embedding service.** It loads one local GGUF
-(llama-cpp) or HF transformer embedding model and exposes it as an
+**A standalone local embedding service.** Run it on your machine, point any
+OpenAI-compatible client at it, and embed text through your own models —
+no API key, no network, no per-token cost.
+
+```bash
+local-embed set-gguf bge-m3 --path D:\models\bge-m3.gguf   # configure a model
+local-embed                                                # serve
+curl http://127.0.0.1:17347/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "bge-m3", "input": "hello world"}'
+```
+
+It loads local **GGUF** (llama-cpp) and/or **HF transformer**
+(sentence-transformers) models and serves them as an
 [OpenAI-compatible](https://platform.openai.com/docs/api-reference/embeddings)
-`/v1/embeddings` URL — any OpenAI-compatible client can embed text through it.
-
-On one port it serves two surfaces: an OpenAI-compatible `/v1/*` API for
-embedding, and a Streamable HTTP MCP endpoint at `/mcp`.
-
-local-embed is three things at once: an independent app, a Streamable HTTP
-**MCP server** (see [As an MCP server](#as-an-mcp-server)), and a conforming
-**slife plugin** (see [Running as a slife embedding backend](#running-as-a-slife-embedding-backend)).
-The product is the embedding URL; the MCP and plugin surfaces are how hosts
-manage the same standalone service.
-
-Two backends: **`gguf`** loads a local `.gguf` file (llama-cpp-python);
-**`transformer`** loads an HF repo id from the local hub cache
-(sentence-transformers). The server never downloads weights — you pre-download
+`/v1/embeddings` API.  The server never downloads weights — you pre-download
 them ([Model weights](#model-weights)).
+
+On the same port it also exposes `/v1/models`, `/health`, and a Streamable
+HTTP MCP endpoint at `/mcp` (see [As an MCP server](#as-an-mcp-server)).
 
 ```
    any OpenAI-compatible client ──┐
-   slife (memdb / memfiles) ──────┤── POST /v1/embeddings ──┐
-   vector DB / RAG pipeline ──────┘                          ▼
+   an editor / agent / pipeline ──┤── POST /v1/embeddings ──┐
+   a RAG indexer ─────────────────┘                          ▼
                                               ┌───────────────────────┐
-   slife (plugin host) ─── /mcp ────────────> │       local-embed     │
+   MCP client ─────────── /mcp ─────────────> │      local-embed      │
                                               │  models load on demand │
                                               └───────────────────────┘
 ```
@@ -41,19 +43,21 @@ them ([Model weights](#model-weights)).
 - **Enforced context limit** — an over-long input is a `400`, never a
   quietly shortened vector; the limit is reconciled with the window the
   weights themselves report.
-- Runs standalone, and can also be **loaded as a slife plugin** (see
-  [Running as a slife embedding backend](#running-as-a-slife-embedding-backend)).
+- **Fully offline** — no telemetry, no downloads at runtime, no API key.
 
 Requires Python ≥ 3.13.
 
 ## Install
 
-The core package is `fastmcp` + `starlette` + `ruamel.yaml` (round-trip YAML —
-the comment-preserving config parser).  The model backends are installed
-separately, per the platform matrix below.
+Two steps: the app, then the model backend you want.  The app is a normal
+Python package; the backend is deliberately *not* bundled, because every
+real install needs a per-platform index or `CMAKE_ARGS` that a package extra
+cannot carry (see the [platform matrix](#gguf-backend--platform-matrix)).
 
-One-click installers (install `uv` if needed, then `uv tool install --force
---python '>=3.13' local-embed` — the backend is **not** included, see below):
+### 1. The app
+
+**One-click** (installs `uv` if needed, then the app into its own isolated
+tool environment):
 
 ```bash
 # macOS / Linux / WSL
@@ -63,10 +67,9 @@ curl -fsSL https://raw.githubusercontent.com/juzcn/local-embed/main/install.sh |
 powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/juzcn/local-embed/main/install.ps1 | iex"
 ```
 
-Manual installs are equivalent:
+**Or by hand** — the installers do exactly this:
 
 ```bash
-# the app + CLI (standalone tool)
 uv tool install --force --python '>=3.13' local-embed
 ```
 
@@ -75,62 +78,52 @@ uv tool install --force --python '>=3.13' local-embed
 > an older environment has no compatible release to install at all. With the
 > constraint, uv fetches a suitable interpreter or fails loudly.
 
-The backend is **not** part of the package — there are no extras, because every
-real install needs a per-platform index or `CMAKE_ARGS` that an extra cannot
-carry.  Add it with `uv pip install --python "$(uv tool dir)/local-embed" …`,
-per the matrix below.
-
 `--force` (used by the installers too) is **idempotent** — the first run
-installs, re-running **updates** to the latest PyPI release.  A plain
+installs, re-running **updates** to the latest release. A plain
 `uv tool install local-embed` no-ops when the tool is already installed.
 
-If you run local-embed inside an *existing* environment (alongside another
-tool), install the backend into **that** environment's interpreter instead of
-creating a separate one.
+That gives you a `local-embed` command on your PATH, in an isolated
+environment that holds nothing but this app. `uv tool uninstall local-embed`
+(or `uninstall.sh` / `uninstall.ps1`) removes it and leaves your config alone.
 
-There is nothing to look up, and no `bin/`-vs-`Scripts/` question: uv takes the
-venv **root directory** and finds the interpreter inside it itself, and
-`uv tool dir` prints the root that holds every tool venv.  So set the target
-once and reuse it:
+### 2. A model backend
+
+Add the backend to the environment the app itself runs in. `uv` takes the
+venv **root directory** and finds the interpreter inside it, so set the
+target once and reuse it — `uv tool dir` prints the root that holds every
+tool venv:
 
 ```bash
-PY="$(uv tool dir)/local-embed"   # installed by the installers above
-PY="$(uv tool dir)/slife"         # running as slife's embedding backend
-PY=.venv                          # a project checkout (run from its root)
+PY="$(uv tool dir)/local-embed"   # installed by step 1
 ```
 
-Pick the line that matches your install, then `uv pip install --python "$PY"
-llama-cpp-python` — the matrix below uses the same `$PY`.
+```powershell
+$PY = "$(uv tool dir)\local-embed"   # the same target, PowerShell syntax
+```
 
-**Every command block here is POSIX shell** (`bash` / `zsh` / WSL).  On Windows
+Then install per the matrix below, e.g. `uv pip install --python "$PY"
+llama-cpp-python`.  Everything past this point uses the same `$PY`.
+The installers print this same link when they finish:
+<https://github.com/juzcn/local-embed#2-a-model-backend>.
+
+> If you run local-embed inside an *existing* environment instead of a tool
+> install (a project checkout's `.venv`, or another app's venv), install the
+> backend into **that** environment's interpreter. `--python` is optional only
+> when the target is unambiguous: uv resolves `--python` > `$VIRTUAL_ENV` >
+> `.venv` in the current directory (walking up), and errors when it finds none
+> — a venv is never created implicitly.
+
+**Every command block here is POSIX shell** (`bash` / `zsh` / WSL). On Windows
 PowerShell the same two things have different spellings, and nothing else
 changes: the variable assignment, and the `VAR=value command` prefix that sets
 an environment variable for one command.
 
 ```powershell
-$PY = "$(uv tool dir)\slife"          # the same target, PowerShell syntax
 $env:CMAKE_ARGS = "-DGGML_CUDA=on"    # then run the uv pip install on its own line
 ```
 
-The install you ran decides which line:
-
-- **Tool install** — `uv tool install local-embed` and the installers above
-  land in uv's tool venv.  When local-embed runs as slife's embedding backend
-  the serving process is slife's, so the backend belongs in slife's tool venv
-  (`install.sh` / `install.ps1` install slife).  A fresh `uv tool install
-  local-embed` is *not* that fix — it builds a separate standalone tool
-  rather than the environment that is serving.
-- **Project checkout** — that checkout's `.venv`.
-- **A running server** — a missing backend is reported at startup with the
-  exact command, its own interpreter included.
-
-`--python` is optional only when the target is unambiguous: uv resolves
-`--python` > `$VIRTUAL_ENV` > `.venv` in the current directory (walking up),
-and errors when it finds none — a venv is never created implicitly.  Give it
-explicitly whenever more than one venv is in play.
-
 A venv is **platform-bound**: a Windows-created `.venv` (`Scripts\`, `Lib\`)
-has no `bin/python` and cannot be used from WSL or a Linux container.  Keep the
+has no `bin/python` and cannot be used from WSL or a Linux container. Keep the
 Linux venv on the Linux filesystem (`~/venvs/local-embed`) rather than creating
 one inside a checkout that lives on a Windows drive — the second `uv venv`
 rewrites `pyvenv.cfg` and breaks the Windows one.
@@ -283,7 +276,7 @@ Installing does **not** fetch a model — get the weights first.
 
 ## Quick start
 
-1. **Install** the app and a backend (above).
+1. **Install** the app, then a backend — steps 1 and 2 of [Install](#install).
 2. **Download weights** — see [Model weights](#model-weights).
 3. **Configure a model** — the CLI helper writes `local_embed.yaml`:
 
@@ -446,8 +439,8 @@ Every error uses the standard envelope
 | `503` | `server_error` | the model's engine is **still loading** (is_loading — retry shortly) or unavailable (backend dependency missing, load failed) | — |
 | `500` | `server_error` | unexpected internal failure | — |
 
-Split long documents into pieces of at most `max_tokens` tokens client-side
-(slife's semantic drainer does this automatically).
+Split long documents into pieces of at most `max_tokens` tokens client-side —
+local-embed rejects an over-long input rather than embedding a prefix of it.
 
 `max_tokens` is the limit the server **enforces**, so it is also the width
 llama.cpp is configured to accept — and it is reconciled with the window the
@@ -486,11 +479,12 @@ client = OpenAI(base_url="http://127.0.0.1:17347/v1", api_key="local")
 vecs = client.embeddings.create(model="bge-m3", input=["hello"])
 ```
 
-## CLI (auxiliary tools)
+## CLI
 
-The `local-embed` CLI is a **helper**, not the product: it starts the service
-and writes the config file. The service is configured by `local_embed.yaml`
-and consumed over the HTTP API — the CLI only makes both steps convenient.
+The `local-embed` command is how you run the app and write its config. The
+service is configured by `local_embed.yaml` and consumed over the HTTP API —
+the CLI just makes both steps convenient, and takes no model or endpoint flags
+of its own.
 
 ### `local-embed` — run the service
 
@@ -502,8 +496,8 @@ The CLI takes no model/endpoint flags — the config is the only source of truth
 A port already in use is a hard error with one actionable line (no silent
 fallback to a free port): stop the other instance or change `port` in the
 config.  Running the CLI while a service already holds the port is a mistake
-worth reporting — the same situation is handled differently when slife spawns
-the plugin (see [Adopting a running service](#adopting-a-running-service)).
+worth reporting — a host that *spawns* local-embed handles the same situation
+differently (see [Using it as another app's embedding backend](#using-it-as-another-apps-embedding-backend)).
 
 ### `local-embed set` / `set-gguf` — write the config
 
@@ -592,49 +586,32 @@ a *service-provider* MCP server, not a tool provider. To embed text, point
 your consumer at the OpenAI-compatible `/v1/*` API instead. A client that only
 speaks stdio can reach it through a stdio→HTTP bridge (e.g. `mcp-remote`).
 
-## Running as a slife embedding backend
+## Using it as another app's embedding backend
 
-local-embed is a **plugin** — one row in slife's central plugin spec, so
-slife spawns it, watches it, and reports it like every other child plugin. It
-is also runnable standalone (`local-embed` on PATH), which is what the CLI is
-for; slife still consumes the MODEL SERVICE purely as an OpenAI-compatible
-HTTP endpoint (never through MCP tools).
+local-embed is an app, not a library — nothing imports it. Anything that
+speaks the OpenAI Embeddings API can consume it, including a host process
+that spawns it as a child. That is the whole integration: give the consumer
+the `base_url` below.
 
-Because its config pins a port that a static embeddings `base_url` points at,
-it is the one plugin with a **fixed** port: it binds that port itself, and that
-port is the service's identity — whoever holds it *is* local-embed as far as
-every host is concerned.
+Because the consumer's `base_url` is static config, local-embed binds a
+**fixed** port (`17347` by default) instead of an OS-assigned one — the port
+is the service's identity, so whoever holds it *is* local-embed as far as
+every consumer is concerned. Two consequences worth knowing:
 
-A second instance is therefore not automatically a mistake.  When slife spawns
-the plugin and finds a local-embed already serving the port (a daemon in WSL
-shared by several hosts, or one you started by hand), the child **adopts** it
-rather than failing; see below.  The same port held by anything that is *not* a
-local-embed is still a hard error, with the reason, and the running service is
-left untouched.
+- **A port already served is a hard error.** Start the CLI while something
+  else holds `17347` and it fails with one actionable line rather than
+  silently taking a different port, which would be invisible to every
+  consumer pointing here. Stop the other instance, or change `port` in
+  `local_embed.yaml`.
+- **One service, many consumers.** Several apps (or several machines in
+  WSL + Windows) can point at a single running local-embed instead of each
+  holding its own copy of a ~2 GB model.
 
-### Adopting a running service
+### Example: slife
 
-The spawned child probes `GET /health` on the configured port before serving:
-
-- **A local-embed answers** → it is adopted.  The child serves MCP on an
-  OS-assigned port, loads **no model of its own**, and its `__check` reports the
-  adopted service's facts (re-read on every probe, so a service that stops
-  answering reads as *unavailable*, not as stale good news).  Hosts' `base_url`
-  was already being served — by an instance that may well be warm.
-- **Nothing answers, or something else does** → the child binds the port and
-  serves as usual; a stranger still fails loudly rather than being adopted.
-
-Adoption is automatic and needs no config.  It is what makes one shared
-service practical: slife on Windows and jack on WSL can both point at a single
-local-embed, instead of each holding its own copy of a ~2 GB model.
-
-The adopter also **watches**: if the adopted service goes away, the child takes
-the fixed port over and serves embeddings itself, warming the models flagged
-`autoload`, so hosts keep embedding without a restart.  The reverse is not
-possible — once the child holds the port, the original service cannot come back
-until the child restarts.
-
-Point slife's embedding config at the daemon's stable port:
+slife spawns local-embed as a plugin and consumes it over HTTP — the same
+OpenAI-compatible endpoint as any other client. Point its embedding config
+at the stable port:
 
 ```yaml
 embeddings:
@@ -650,16 +627,17 @@ embeddings:
 slife treats every embedding model as a remote OpenAI-compatible endpoint —
 local-embed is one such endpoint. The model a request hits is the one the
 caller names; when the config names no model, slife discovers it from
-`GET /v1/models` (the first entry) on load. When the daemon is unreachable,
-slife degrades gracefully to keyword search (`check_embeddings` in
-`system_health` probes the **active** provider's HTTP endpoint and reports it
-down — it never assumes that provider is local-embed).
+`GET /v1/models` (the first entry) on load. When the service is unreachable,
+slife degrades gracefully to keyword search.
 
-The MCP surface it still serves is the internal **`__check`** (engine status:
-model list, dimensions, load state) — a service-provider facade
-for direct probing, not a slife plugin contract. It also serves plain OpenAPI
-routes (`/v1/embeddings`, `/v1/models`, `/health`) on the same port via
-`@mcp.custom_route` — one port, two protocols, no slife involvement.
+When slife spawns the plugin and finds a local-embed already serving the
+port (a daemon shared by several hosts, or one you started by hand), the
+spawned child **adopts** it rather than failing: it serves MCP on an
+OS-assigned port, loads no model of its own, and its `__check` reports the
+adopted service's facts. The running instance keeps serving. The adopter
+also stands watch — if the adopted service goes away, the child takes the
+fixed port over and serves embeddings itself, so consumers keep embedding
+without a restart.
 
 ---
 
@@ -667,15 +645,23 @@ routes (`/v1/embeddings`, `/v1/models`, `/health`) on the same port via
 
 | Symptom | Fix |
 |---------|-----|
-| Log: `backend_unavailable … reason=llama_cpp_not_installed` / `sentence_transformers_not_installed` | Run the platform's install from *Install* above — the log prints the exact command. |
+| Log: `backend_unavailable … reason=llama_cpp_not_installed` / `sentence_transformers_not_installed` | Run the platform's install from *Install* above — the log prints the exact command for your platform, its own interpreter included. |
 | Transformer route won't load with `HF_HUB_OFFLINE=1` | The repo isn't in the cache — run `hf download BAAI/bge-m3` and make sure `HF_HUB_CACHE` points at the cache that holds it. |
-| GGUF route won't load | File missing at `gguf_path` — check `BGE_M3_GGUF_PATH` / `gguf_path`, and that the client requests `"bge-m3"` (all configured models are peers — nothing is gated behind an `active_model`). |
-| `system_health` shows `embeddings` as `unavailable` | The active embedding endpoint didn't answer `GET /v1/models`. If that provider is `local_embed`, check the `local-embed` line in the same report — slife starts the service itself, so a missing one means the plugin failed to start (its log has the reason; a **non**-local-embed service holding port 17347 will do it). Otherwise fix the cloud provider's key: `api_key` resolves `${VAR}` → env → credstore. The component only ever probes the **active** provider, and its line is keyed by that provider's id. |
-| First embed very slow | A transformer download/warm-up is deferred to the first embed; subsequent calls are fast. |
+| GGUF route won't load | File missing at `gguf_path` — check the path in `local_embed.yaml`, and that the client requests a configured model id (`GET /v1/models` lists them; all configured models are peers — nothing is gated behind an `active_model`). |
+| `Error: cannot bind 127.0.0.1:17347` on start | Something already holds the port. If it is another local-embed, it is already serving — point your client at it instead, or stop it. If it is a different service, change `port` in `local_embed.yaml`. |
+| An embedding looks wrong / too short a document matched | The input exceeded the model's context window. Check `max_tokens` for that model in `GET /v1/models` — the limit in force is the model's real window, and an over-long input is a `400`, never a silently truncated vector. |
+| First embed very slow | The model's weights are loading (and, for a transformer, warming up) on the first request that names it. Set `autoload: true` on that model to pre-warm it at startup instead. |
 
-## Re-adding a backend (manual installs)
+## Re-adding a backend (after an upgrade)
 
-The backends are **not** package extras — every real install needs a per-platform choice (a PyTorch index, `CMAKE_ARGS`, or the upstream Windows wheel index). Install the package directly; the platform matrix under *Install* above is the authority on which command your platform needs:
+`uv tool install --force` (what the installers and an update run) rebuilds the
+tool environment, which **drops** any backend added to it — re-run the
+`uv pip install` from step 2 of [Install](#install) after upgrading.
+
+The backends are **not** package extras — every real install needs a
+per-platform choice (a PyTorch index, `CMAKE_ARGS`, or the upstream Windows
+wheel index), so the platform matrix above is the authority on which command
+your platform needs:
 
 | Backend | Package | Cost |
 |---------|---------|------|
@@ -683,15 +669,15 @@ The backends are **not** package extras — every real install needs a per-platf
 | Transformer | `sentence-transformers` | ~2 GB + the model |
 
 ```bash
-# a tool install (the installers) — into the tool's own venv:
+# into the app's own tool venv (step 1's tool install):
 uv pip install --python "$(uv tool dir)/local-embed" llama-cpp-python
 uv pip install --python "$(uv tool dir)/local-embed" sentence-transformers
 
-# uvx / git checkout — there is no tool venv; add the package to the ephemeral env:
+# or run from a checkout with no tool venv at all — add to the ephemeral env:
 uvx --with llama-cpp-python --from git+https://github.com/juzcn/local-embed.git local-embed
 ```
 
-Add `--extra-index-url …/whl/cpu` (or `…/whl/cu124`) on Windows and `CMAKE_ARGS` for the Linux/Metal GPU builds; on a GPU-less Linux machine install the CPU `torch` first — the step-1 bullets give both. The legacy in-process embedding backends use these same two packages, so this covers them too.
+Add `--extra-index-url …/whl/cpu` (or `…/whl/cu124`) on Windows and `CMAKE_ARGS` for the Linux/Metal GPU builds; on a GPU-less Linux machine install the CPU `torch` first — the platform matrix gives both.
 
 Re-running an installer rebuilds the tool environment (`uv tool install --force`), which **drops** a backend added this way — re-run the `uv pip install` above after an upgrade.
 
@@ -715,7 +701,7 @@ Bump `version` in `pyproject.toml`, commit, then push a tag with the same
 version:
 
 ```bash
-git tag -a v0.3.1 -m "local-embed 0.3.1" && git push origin v0.3.1
+git tag -a v0.4.0 -m "local-embed 0.4.0" && git push origin v0.4.0
 ```
 
 `.github/workflows/publish.yml` fails unless the tag matches the package

@@ -51,8 +51,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="configure a transformer model",
         description=(
             "Add (or update) a transformer model in local_embed.yaml and pin "
-            "the HF cache + port.  Idempotent; the model must already be "
-            "downloaded into the cache."
+            "the HF cache.  The configured port is kept unless --port is "
+            "given.  Idempotent; the model must already be downloaded into "
+            "the cache."
         ),
     )
     set_p.add_argument(
@@ -80,8 +81,9 @@ def build_parser() -> argparse.ArgumentParser:
         "set-gguf",
         help="configure a gguf model",
         description=(
-            "Add (or update) a gguf model in local_embed.yaml and pin the "
-            "port.  Idempotent; --path must point at an existing .gguf file."
+            "Add (or update) a gguf model in local_embed.yaml.  The "
+            "configured port is kept unless --port is given.  Idempotent; "
+            "--path must point at an existing .gguf file."
         ),
     )
     gguf_p.add_argument(

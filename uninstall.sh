@@ -49,7 +49,7 @@ else
 fi
 
 echo ""
-echo -e "${GRAY}Model weights under ~/.cache/huggingface are shared with other tools${NC}"
+echo -e "${GRAY}Model weights under ~/.cache/huggingface/hub are shared with other tools${NC}"
 echo -e "${GRAY}and are never touched by this script.${NC}"
 echo ""
 echo -e "${CYAN}Done.${NC}"
