@@ -701,7 +701,7 @@ Bump `version` in `pyproject.toml`, commit, then push a tag with the same
 version:
 
 ```bash
-git tag -a v0.4.0 -m "local-embed 0.4.0" && git push origin v0.4.0
+git tag -a v0.4.1 -m "local-embed 0.4.1" && git push origin v0.4.1
 ```
 
 `.github/workflows/publish.yml` fails unless the tag matches the package
